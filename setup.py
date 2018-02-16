@@ -19,7 +19,6 @@ SETUP = {
     'install_requires': [
         'lxml',
         'titlecase',
-        'pyenchant',
         'pypandoc',
         'python-gitlab',
     ],
