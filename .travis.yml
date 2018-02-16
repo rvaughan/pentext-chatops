@@ -1,0 +1,9 @@
+language: python
+python:
+  - "2.7"
+  - "3.6"
+# command to run tests
+install: pip install tox-travis
+script: 
+  - tox -e pep8
+  - tox
