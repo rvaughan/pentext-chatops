@@ -23,24 +23,26 @@ from __future__ import print_function
 
 import argparse
 import os
+import random
 import subprocess
 from subprocess import PIPE
 import sys
 import textwrap
-
+from ros.logger import (
+    debug,
+    rc_log,
+)
 
 GITREV = 'GITREV'  # Magic tag which gets replaced by the git short commit hash
 OFFERTE = 'generate_offerte.xsl'  # XSL for generating waivers
 WAIVER = 'waiver_'  # prefix for waivers
-EXECSUMMARY = 'execsummary' # generating an executive summary instead of a report
+EXECSUMMARY = 'execsummary'  # generating an executive summary instead of a report
 
 
 def parse_arguments():
     """
     Parses command line arguments.
     """
-    global verboseprint
-    global verboseerror
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=textwrap.dedent('''\
@@ -56,8 +58,11 @@ the Free Software Foundation, either version 3 of the License, or
                         help='overwrite output file if it already exists')
     parser.add_argument('-date', action='store',
                         help='the invoice date')
-    parser.add_argument('-execsummary', action='store_true',
+    parser.add_argument('--execsummary', action='store_true',
                         help="""create an executive summary as well as a report (true/false).
+                        Default: false """)
+    parser.add_argument('--nopw', action='store_true',
+                        help="""password-protect the pdf.
                         Default: false """)
     parser.add_argument('--fop-config', action='store',
                         default='/etc/docbuilder/fop.xconf',
@@ -93,20 +98,8 @@ the Free Software Foundation, either version 3 of the License, or
     parser.add_argument('-w', '--warnings', action='store_true',
                         help='show warnings')
     args = parser.parse_args()
-    if args.verbose:
-        def verboseprint(*args):  # pylint: disable=missing-docstring
-            for arg in args:
-                print(arg, end="")
-            print()
 
-        def verboseerror(*args):  # pylint: disable=missing-docstring
-            for arg in args:
-                print(arg, end="", file=sys.stderr)
-            print(file=sys.stderr)
-    else:
-        verboseprint = lambda *a: None
-        verboseerror = lambda *a: None
-    return vars(parser.parse_args())
+    return vars(args)
 
 
 def print_output(stdout, stderr):
@@ -114,9 +107,9 @@ def print_output(stdout, stderr):
     Prints out standard out and standard err using the verboseprint function.
     """
     if stdout:
-        verboseprint('[+] stdout: {0}'.format(stdout))
+        debug('[+] stdout: {0}'.format(stdout))  # noqa F821
     if stderr:
-        verboseerror('[-] stderr: {0}'.format(stderr))
+        debug('[-] stderr: {0}'.format(stderr))  # noqa F821
 
 
 def change_tag(fop):
@@ -138,6 +131,13 @@ def change_tag(fop):
         print('[-] could not execute git - is git installed ?')
 
 
+def generate_pw():
+    s = "abcdefghijklmnopqrstuvwxyz01234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()?"
+    length = 12
+    p = "".join(random.sample(s, length))
+    return(p)
+
+
 def to_fo(options):
     """
     Creates a fo output file based on a XML file.
@@ -155,6 +155,9 @@ def to_fo(options):
     process = subprocess.Popen(cmd, stdout=PIPE, stderr=PIPE)
     stdout, stderr = process.communicate()
     print_output(stdout, stderr)
+    if options['verbose']:
+        rc_log(stdout)
+        rc_log(stderr)
     if process.returncode:
         print_exit('[-] Error creating fo file from XML input',
                    process.returncode)
@@ -171,15 +174,25 @@ def to_pdf(options):
     """
     cmd = [options['fop_binary'], '-c', options['fop_config'], options['fop'],
            options['output']]
+    if not options['nopw']:
+        pw = generate_pw()
+        cmd = cmd + ['-u', pw]
+    if options['verbose']:
+        cmd = cmd + ['-v']
     try:
-        verboseprint('Converting {0} to {1}'.format(options['fop'],
+        debug('Converting {0} to {1}'.format(options['fop'],  # noqa F821
                                                     options['output']))
         process = subprocess.Popen(cmd, stdout=PIPE, stderr=PIPE)
         stdout, stderr = process.communicate()
         result = process.returncode
         print_output(stdout, stderr)
+        if options['verbose']:
+            rc_log(stdout)
+            rc_log(stderr)
         if result == 0:
             print('[+] Succesfully built ' + options['output'])
+            if not options['nopw']:
+                print('\n[+] Password for this pdf is ' + pw)
     except OSError as exception:
         print_exit('[-] ERR: {0}'.format(exception.strerror), exception.errno)
     return result == 0
@@ -197,8 +210,6 @@ def main():
     """
     The main program.
     """
-    global verboseerror
-    global verboseprint
     result = False
     options = parse_arguments()
     if not os.path.isfile(options['input']):
@@ -219,7 +230,7 @@ def main():
     if result:
         if OFFERTE in options['xslt']:  # an offerte can generate multiple fo's
             report_output = options['output']
-            verboseprint('generating separate waivers detected')
+            debug('generating separate waivers detected')  # noqa F821
             output_dir = os.path.dirname(options['output'])
             fop_dir = os.path.dirname(options['fop'])
             try:
@@ -234,9 +245,9 @@ def main():
             except OSError as exception:
                 print_exit('[-] ERR: {0}'.format(exception.strerror),
                            exception.errno)
-        if options['execsummary'] == True:  # we're generating a summary as well as a report
+        if options['execsummary'] is True:  # we're generating a summary as well as a report
             report_output = options['output']
-            verboseprint('generating additional executive summary')
+            debug('generating additional executive summary')
             output_dir = os.path.dirname(options['output'])
             fop_dir = os.path.dirname(options['fop'])
             try:

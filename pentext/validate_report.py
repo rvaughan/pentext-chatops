@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
-"""Cross-checks findings, validates XML files, offerte and report files.
+"""
+Cross-checks findings, validates XML files, offerte and report files.
 
 This script is part of the PenText framework
                            https://pentext.org
@@ -22,6 +23,10 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 import argparse
+try:
+    from importlib import reload
+except ImportError:
+    pass
 import logging
 import mmap
 import os
@@ -31,32 +36,39 @@ import sys
 import textwrap
 import xml.sax
 
-
 try:
     from lxml import etree as ElementTree
-    from titlecase import titlecase
-    import enchant
 except ImportError as exception:
-    print('[-] This script needs the lxml, pyenchant and titlecase libary ({0}'.format(exception),
+    print('[-] This script needs lxml',
           file=sys.stderr)
-    print("    Install requirements using pip install -r requirements.txt",
-          file=sys.stderr)
+    print("Install lxml with: sudo pip install lxml", file=sys.stderr)
     sys.exit(-1)
 
 
 # When set to True, the report will be validated using docbuilder
 DOCBUILDER = False
-UPPERCASE = ['TCP', 'UDP', 'XSS']
-VOCABULARY = 'project-vocabulary.txt'
+VOCABULARY = 'project-vocabulary.pws'
 # Snippets may contain XML fragments without the proper entities
 EXAMPLEDIR = 'examples/'
+NOT_CAPITALIZED = ['a', 'an', 'and', 'as', 'at', 'but', 'by', 'for', 'in',
+                   'jQuery', 'jQuery-UI', 'nor', 'of', 'on', 'or', 'the', 'to',
+                   'up']
 SNIPPETDIR = 'snippets/'
-STATUS = 25 # loglevel for 'generic' status messages
+STATUS = 25  # loglevel for 'generic' status messages
 TEMPLATEDIR = 'templates/'
 OFFERTE = '/offerte.xml'
 REPORT = '/report.xml'
 WARN_LINE = 80  # There should be a separation character after x characters...
 MAX_LINE = 86  # ... and before y
+
+
+if DOCBUILDER:
+    import docbuilder_proxy
+    import proxy_vagrant
+try:
+    import aspell
+except ImportError:
+    print('[-] aspell not installed: spelling not available',)
 
 
 class LogFormatter(logging.Formatter):
@@ -68,12 +80,12 @@ class LogFormatter(logging.Formatter):
     # STATUS  = (25) generic status messages
     # WARNING = (30) warning messages (= errors in validation)
     # ERROR   = (40) error messages (= program errors)
-    FORMATS = {logging.DEBUG :"DEBUG: %(module)s: %(lineno)d: %(message)s",
-               logging.INFO : "[*] %(message)s",
-               STATUS : "[+] %(message)s",
-               logging.WARN : "[-] %(message)s",
-               logging.ERROR : "ERROR: %(message)s",
-               'DEFAULT' : "%(message)s"}
+    FORMATS = {logging.DEBUG: "DEBUG: %(module)s: %(lineno)d: %(message)s",
+               logging.INFO: "[*] %(message)s",
+               STATUS: "[+] %(message)s",
+               logging.WARN: "[-] %(message)s",
+               logging.ERROR: "ERROR: %(message)s",
+               'DEFAULT': "%(message)s"}
 
     def format(self, record):
         self._fmt = self.FORMATS.get(record.levelno, self.FORMATS['DEFAULT'])
@@ -122,38 +134,55 @@ the Free Software Foundation, either version 3 of the License, or
     return vars(parser.parse_args())
 
 
-def validate_spelling(tree, filename, options):
+def initialize_speller():
+    """
+    Initialize and return speller module.
+    """
+    speller = None
+    try:
+        speller = aspell.Speller(('lang', 'en'),
+                                 ('personal-dir', '.'),
+                                 ('personal', VOCABULARY))
+    except aspell.AspellConfigError as exception:  # some versions of aspell use a different path
+        logging.debug('Encountered exception when trying to intialize spelling: %s',
+                      exception)
+        try:
+            speller = aspell.Speller(('lang', 'en'),
+                                     ('personal-path', './' + VOCABULARY))
+        except aspell.AspellSpellerError as exception:
+            logging.error('Could not initialize speller: %s', exception)
+    if speller:
+        [logging.debug('%s %s', i[0], i[2]) for i in speller.ConfigKeys()]
+    return speller
+
+
+def validate_spelling(tree, filename, options, speller):
     """
     Check spelling of text within tags.
     If options['learn'], then unknown words will be added to the dictionary.
     """
     result = True
-    learn = []
-    speller = enchant.DictWithPWL("en_US", VOCABULARY)
     if not speller:
         options['spelling'] = False
         return result
     try:
         root = tree.getroot()
         for section in root.iter():
-            if section.text and isinstance(section.tag, basestring) and \
+            if section.text and isinstance(section.tag, str) and \
                section.tag not in ('a', 'code', 'monospace', 'pre'):
                 for word in re.findall('([a-zA-Z]+\'?[a-zA-Z]+)', section.text):
                     if not speller.check(word):
-                        if word.upper() not in (learned.upper() for learned in learn):
-                            learn.append(word)
-                        result = False
-                        logging.warning('Misspelled (unknown) word %s in %s',
-                                        word.encode('utf-8'), filename)
-    except:
-        print('[-] Hmm. spell exception')
-    if options['learn'] and learn:
-        try:
-            with open(VOCABULARY, mode='a+') as open_file:
-                for word in learn:
-                    open_file.write(word + '\n')
-        except IOError:
-            logging.error('Could not write to %s', open_file)
+                        if options['learn']:
+                            speller.addtoPersonal(word)
+                        else:
+                            result = False
+                            logging.warning('Misspelled (unknown) word %s in %s',
+                                            word.encode('utf-8'), filename)
+        if options['learn']:
+            speller.saveAllwords()
+    except aspell.AspellSpellerError as exception:
+        logging.error('Disabled spelling (%s)', exception)
+        options['spelling'] = False
     return result
 
 
@@ -187,14 +216,15 @@ def open_editor(filename):
 
 def validate_files(filenames, options):
     """
-    Check file extensions and calls appropriate validator function.
-    Returns True if all files validated successfully.
+    Checks file extensions and calls appropriate validator function.
+    Returns True if all files validated succesfully.
     """
     result = True
     masters = []
     findings = []
     non_findings = []
     scans = []
+    speller = initialize_speller()
     for filename in filenames:
         if (filename.lower().endswith('.xml') or
                 filename.lower().endswith('xml"')):
@@ -202,7 +232,9 @@ def validate_files(filenames, options):
                 if (OFFERTE in filename and options['offer']) or \
                    (REPORT in filename and not options['no_report']):
                     masters.append(filename)
-                type_result, xml_type = validate_xml(filename, options)
+                    # try:
+                type_result, xml_type = validate_xml(
+                    filename, options, speller)
                 result = result and type_result
                 if 'non-finding' in xml_type:
                     non_findings.append(filename)
@@ -212,8 +244,10 @@ def validate_files(filenames, options):
                     else:
                         if 'scans' in xml_type:
                             scans.append(filename)
-    for master in masters:
-        result = validate_master(master, findings, non_findings, scans, options) and result
+    if len(masters):
+        for master in masters:
+            result = validate_master(
+                master, findings, non_findings, scans, options) and result
     return result
 
 
@@ -227,7 +261,7 @@ def validate_report():
     return proxy_vagrant.execute_command(host, command)
 
 
-def validate_xml(filename, options):
+def validate_xml(filename, options, speller):
     """
     Validates XML file by trying to parse it.
     Returns True if the file validated successfully.
@@ -241,10 +275,12 @@ def validate_xml(filename, options):
     try:
         with open(filename, 'rb') as xml_file:
             xml.sax.parse(xml_file, xml.sax.ContentHandler())
-            tree = ElementTree.parse(filename, ElementTree.XMLParser(strip_cdata=False))
-            tree.xinclude() # Include everything
-            type_result, xml_type = validate_type(tree, filename, options)
-            result = validate_long_lines(tree, filename, options) and result and type_result
+            tree = ElementTree.parse(
+                filename, ElementTree.XMLParser(strip_cdata=False))
+            type_result, xml_type = validate_type(
+                tree, filename, options, speller)
+            result = validate_long_lines(
+                tree, filename, options) and result and type_result
         if options['edit'] and not result:
             open_editor(filename)
     except (xml.sax.SAXException, ElementTree.ParseError) as exception:
@@ -268,27 +304,31 @@ def get_all_text(node):
     return text_string.strip()
 
 
-def abbreviations(word, **kwargs):
-    """
-    Check whether word needs to be all caps
-    """
-    if word.upper() in (UPPERCASE):
-        return word.upper()
-
-
-def capitalize(sentence):
-    """Return capitalized version of @sentence."""
-    return titlecase(sentence, callback=abbreviations)
-
-
 def is_capitalized(line):
-    """Check whether all words in @line start with a capital."""
-    return not line or line.strip() == titlecase(line, callback=abbreviations).strip()
+    """
+    Checks whether all words in @line start with a capital.
+
+    Returns True if that's the case.
+    """
+    return not line or line.strip() == capitalize(line)
 
 
-def validate_type(tree, filename, options):
-    """Perform specific checks based on type.
+def capitalize(line):
+    """
+    Returns a capitalized version of @line, where the first word and all other
+    words not in NOT_CAPITALIZED are capitalized.
+    """
+    capitalized = ''
+    for word in line.strip().split():
+        if word not in NOT_CAPITALIZED or not len(capitalized):
+            word = word[0].upper() + word[1:]
+        capitalized += word + ' '
+    return capitalized.strip()
 
+
+def validate_type(tree, filename, options, speller):
+    """
+    Performs specific checks based on type.
     Currently only finding and non-finding are supported.
     """
     result = True
@@ -298,11 +338,11 @@ def validate_type(tree, filename, options):
     attributes = []
     tags = []
     if options['spelling']:
-        result = validate_spelling(tree, filename, options)
+        result = validate_spelling(tree, filename, options, speller)
     if xml_type == 'pentest_report':
         attributes = ['findingCode']
     if xml_type == 'finding':
-        attributes = ['threatLevel', 'type', 'id', 'status']
+        attributes = ['threatLevel', 'type', 'id']
         tags = ['title', 'description', 'technicaldescription', 'impact',
                 'recommendation']
     if xml_type == 'non-finding':
@@ -323,21 +363,16 @@ def validate_type(tree, filename, options):
         else:
             if attribute == 'threatLevel' and root.attrib[attribute] not in \
                ('Low', 'Moderate', 'Elevated', 'High', 'Extreme'):
-                print('[-] threatLevel is not Low, Moderate, High, Elevated or Extreme: {0} {1}'.
-                      format(filename, root.attrib[attribute]))
+                print('[-] threatLevel is not Low, Moderate, High, Elevated or Extreme: {0}'.
+                      format(root.attrib[attribute]))
                 result = False
-            if attribute == 'type' and (options['capitalization'] and not \
+            if attribute == 'type' and (options['capitalization'] and not
                                         is_capitalized(root.attrib[attribute])):
                 print('[A] Type missing capitalization (expected {0}, read {1})'.
                       format(capitalize(root.attrib[attribute]),
                              root.attrib[attribute]))
-                root.attrib[attribute] = titlecase(root.attrib[attribute], callback=abbreviations)
+                root.attrib[attribute] = capitalize(root.attrib[attribute])
                 fix = True
-            if attribute == 'status' and root.attrib[attribute] not in \
-               ('new', 'unresolved', 'not_retested', 'resolved'):
-                print('[-] status ({0}) should be one of: new, unresolved, not_retested or resolved: {1}'.
-                      format(root.attrib[attribute], filename))
-                result = False
     for tag in tags:
         if root.find(tag) is None:
             logging.warning('Missing tag in %s: %s', filename, tag)
@@ -347,16 +382,17 @@ def validate_type(tree, filename, options):
             logging.warning('Empty tag in %s: %s', filename, tag)
             result = False
             continue
-        if tag == 'title' and (options['capitalization'] and \
+        if tag == 'title' and (options['capitalization'] and
                                not is_capitalized(root.find(tag).text)):
             print('[A] Title missing capitalization in {0} (expected {1}, read {2})'.
-                  format(filename, titlecase(root.find(tag).text, callback=abbreviations).strip(),
-                         root.find(tag).text.strip()))
-            root.find(tag).text = titlecase(root.find(tag).text, callback=abbreviations)
+                  format(filename, capitalize(root.find(tag).text),
+                         root.find(tag).text))
+            root.find(tag).text = capitalize(root.find(tag).text)
             fix = True
         all_text = get_all_text(root.find(tag))
         if tag == 'description' and all_text.strip()[-1] != '.':
-            print('[A] Description missing final dot in {0}: {1}'.format(filename, all_text))
+            print('[A] Description missing final dot in {0}: {1}'.format(
+                filename, all_text))
             root.find(tag).text = all_text.strip() + '.'
             fix = True
     if fix:
@@ -395,7 +431,8 @@ def validate_long_lines(tree, filename, options):
                     print('cutted line {0}'.format(line))
                     line = line[cutpoint:]
                     fixed_text += fixed_line.encode('utf-8')
-                    print('[A] can be fixed (breaking at {0}): {1}'.format(cutpoint, fixed_line))
+                    print('[A] can be fixed (breaking at {0}): {1}'.format(
+                        cutpoint, fixed_line))
                 fixed_text += line + '\n'
             if fix and options['auto_fix']:
                 print('[+] Automatically fixed {0}'.format(filename))
@@ -408,8 +445,7 @@ def validate_long_lines(tree, filename, options):
 
 def validate_master(filename, findings, non_findings, scans, options):
     """
-    Validate master file.
-    Returns True if master file was successfully validated.
+    Validates master file.
     """
     result = True
     include_findings = []
@@ -418,19 +454,21 @@ def validate_master(filename, findings, non_findings, scans, options):
     try:
         xmltree = ElementTree.parse(filename,
                                     ElementTree.XMLParser(strip_cdata=False))
-        xmltree.xinclude() # include all stuff
         if not find_keyword(xmltree, 'TODO', filename):
             print('[-] Keyword checks failed for {0}'.format(filename))
             result = False
-        logging.info('Performing cross check on findings, non-findings and scans...')
+            logging.info(
+                'Performing cross check on findings, non-findings and scans...')
         for finding in findings:
             if not cross_check_file(filename, finding):
-                print('[A] Cross check failed for finding {0}'.format(finding))
+                print('[A] Cross check failed for finding {0}'.
+                      format(finding))
                 include_findings.append(finding)
                 result = False
         for non_finding in non_findings:
             if not cross_check_file(filename, non_finding):
-                logging.warning('Cross check failed for non-finding %s', non_finding)
+                logging.warning(
+                    'Cross check failed for non-finding %s', non_finding)
                 include_nonfindings.append(non_finding)
                 result = False
         if result:
@@ -468,7 +506,8 @@ def cross_check_file(filename, external):
     result = True
     report_text = report_string(filename)
     if report_text.find(external) == -1:
-        logging.warning('Could not find a reference in %s to %s', filename, external)
+        logging.warning(
+            'Could not find a reference in %s to %s', filename, external)
         result = False
     return result
 
@@ -477,16 +516,18 @@ def add_include(filename, identifier, findings):
     """
     Adds XML include based on the identifier ('findings' or 'nonFindings').
     """
-    tree = ElementTree.parse(filename, ElementTree.XMLParser(strip_cdata=False))
-    root = tree.getroot()
+    tree = ElementTree.parse(
+        filename, ElementTree.XMLParser(strip_cdata=False))
     for section in tree.iter('section'):
         if section.attrib['id'] == identifier:
             finding_section = section
     if finding_section is not None:
         for finding in findings:
-            new_finding = ElementTree.XML('<placeholderinclude href="../{0}"/>'.format(finding))
+            new_finding = ElementTree.XML(
+                '<placeholderinclude href="../{0}"/>'.format(finding))
             finding_section.append(new_finding)
-            tree.write(filename, encoding="utf-8", xml_declaration=True, pretty_print=True)
+            tree.write(filename, encoding="utf-8",
+                       xml_declaration=True, pretty_print=True)
 
 
 def close_file(filename):
@@ -501,8 +542,10 @@ def close_file(filename):
     f = open(fileout, 'w')
     f.write(newdata)
     f.close()
-    tree = ElementTree.parse(filename, ElementTree.XMLParser(strip_cdata=False))
-    tree.write(filename, encoding="utf-8", xml_declaration=True, pretty_print=True)
+    tree = ElementTree.parse(
+        filename, ElementTree.XMLParser(strip_cdata=False))
+    tree.write(filename, encoding="utf-8",
+               xml_declaration=True, pretty_print=True)
 
 
 def find_keyword(xmltree, keyword, filename):
@@ -517,7 +560,8 @@ def find_keyword(xmltree, keyword, filename):
             section = 'in {0}'.format(tag.attrib['id'])
         if tag.text:
             if keyword in tag.text:
-                logging.warning('%s found in %s %s', keyword, filename, section)
+                logging.warning('%s found in %s %s',
+                                keyword, filename, section)
                 result = False
     return result
 
@@ -566,7 +610,8 @@ def main():
     else:
         logging.warning('Validation failed')
     if options['spelling'] and options['learn']:
-        logging.log(STATUS, 'Don\'t forget to check the vocabulary file %s', VOCABULARY)
+        logging.log(
+            STATUS, 'Don\'t forget to check the vocabulary file %s', VOCABULARY)
 
 
 if __name__ == "__main__":
